@@ -337,6 +337,3 @@ Table integration_links {
   visible_to_client boolean
 }
 ```
-
-
-👉 Quer que eu já prepare também um **README.md** com instruções de aplicação (ordem correta dos scripts, como rodar no Supabase, como testar RLS com `auth.uid()` simulado)?
