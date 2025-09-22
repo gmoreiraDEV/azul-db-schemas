@@ -4,7 +4,23 @@
 -- Pré-requisito: 01_base.sql
 -- =========================================================
 
+-- 0) Garantir UNIQUE composta em clients (id, firm_id) para suportar FK composta
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conname = 'clients_id_firm_unique'
+      and conrelid = 'azul.clients'::regclass
+  ) then
+    alter table azul.clients
+      add constraint clients_id_firm_unique unique (id, firm_id);
+  end if;
+end$$;
+
+-- =========================================================
 -- 1) Enums
+-- =========================================================
 do $$
 begin
   if not exists (select 1 from pg_type where typname = 'doc_status_enum') then
@@ -35,7 +51,9 @@ begin
   end if;
 end$$;
 
+-- =========================================================
 -- 2) Tipos de Documento
+-- =========================================================
 create table if not exists azul.document_types (
   id uuid primary key default gen_random_uuid(),
   firm_id uuid not null references azul.firms(id) on delete cascade,
@@ -59,12 +77,14 @@ create trigger trg_document_types_updated_at
 before update on azul.document_types
 for each row execute function azul.set_updated_at();
 
--- 3) Documentos (cabecalho por cliente)
+-- =========================================================
+-- 3) Documentos (cabeçalho por cliente)
+-- =========================================================
 create table if not exists azul.documents (
   id uuid primary key default gen_random_uuid(),
 
-  firm_id   uuid not null references azul.firms(id)   on delete cascade,
-  client_id uuid not null references azul.clients(id) on delete cascade,
+  firm_id   uuid not null references azul.firms(id) on delete cascade,
+  client_id uuid not null,
   type_id   uuid not null references azul.document_types(id) on delete restrict,
 
   title text not null,
@@ -80,31 +100,43 @@ create table if not exists azul.documents (
   issue_date date,
 
   -- controle
-  latest_version_id uuid, -- ref para azul.document_versions.id
+  latest_version_id uuid,               -- referência "solta" (sem FK) para evitar ciclo
   created_by uuid not null references azul.profiles(id) on delete restrict,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
 
-  constraint documents_comp_month_chk check (competence_month is null or (competence_month between 1 and 12)),
-  constraint documents_client_firm_consistency check (
-    exists (
-      select 1 from azul.clients c
-      where c.id = client_id and c.firm_id = firm_id
-    )
-  )
+  constraint documents_comp_month_chk check (competence_month is null or (competence_month between 1 and 12))
 );
 
-create index if not exists idx_documents_firm on azul.documents(firm_id);
-create index if not exists idx_documents_client on azul.documents(client_id);
-create index if not exists idx_documents_type on azul.documents(type_id);
-create index if not exists idx_documents_status on azul.documents(status);
+-- FK composta para garantir que o client pertença à firm
+do $$
+begin
+  if not exists (
+    select 1 from pg_constraint
+    where conname = 'documents_client_firm_fk'
+      and conrelid = 'azul.documents'::regclass
+  ) then
+    alter table azul.documents
+      add constraint documents_client_firm_fk
+      foreign key (client_id, firm_id)
+      references azul.clients(id, firm_id)
+      on delete cascade;
+  end if;
+end$$;
+
+create index if not exists idx_documents_firm       on azul.documents(firm_id);
+create index if not exists idx_documents_client     on azul.documents(client_id);
+create index if not exists idx_documents_type       on azul.documents(type_id);
+create index if not exists idx_documents_status     on azul.documents(status);
 create index if not exists idx_documents_visibility on azul.documents(is_visible_to_client);
 
 create trigger trg_documents_updated_at
 before update on azul.documents
 for each row execute function azul.set_updated_at();
 
+-- =========================================================
 -- 4) Versões de Documento (arquivos)
+-- =========================================================
 create table if not exists azul.document_versions (
   id uuid primary key default gen_random_uuid(),
   document_id uuid not null references azul.documents(id) on delete cascade,
@@ -123,10 +155,10 @@ create table if not exists azul.document_versions (
   constraint document_versions_unique_per_doc unique (document_id, version_no)
 );
 
-create index if not exists idx_document_versions_doc on azul.document_versions(document_id);
+create index if not exists idx_document_versions_doc         on azul.document_versions(document_id);
 create index if not exists idx_document_versions_uploaded_by on azul.document_versions(uploaded_by);
 
--- 4.1) Trigger: auto-incremento de version_no
+-- Auto-incremento do version_no
 create or replace function azul.document_versions_next_version_no()
 returns trigger as $$
 declare
@@ -150,7 +182,7 @@ create trigger trg_document_versions_next_no
 before insert on azul.document_versions
 for each row execute function azul.document_versions_next_version_no();
 
--- 4.2) Trigger: atualizar latest_version_id no documents
+-- Atualiza latest_version_id no documents após cada nova versão
 create or replace function azul.document_versions_bump_latest()
 returns trigger as $$
 begin
@@ -167,8 +199,9 @@ create trigger trg_document_versions_bump_latest
 after insert on azul.document_versions
 for each row execute function azul.document_versions_bump_latest();
 
+-- =========================================================
 -- 5) (Opcional) Eventos/Logs de documento (view/download/ack)
--- Mantém histórico de interações dos usuários com o documento
+-- =========================================================
 create table if not exists azul.document_events (
   id uuid primary key default gen_random_uuid(),
   document_id uuid not null references azul.documents(id) on delete cascade,
@@ -178,22 +211,22 @@ create table if not exists azul.document_events (
   created_at timestamptz not null default now()
 );
 
-create index if not exists idx_document_events_doc on azul.document_events(document_id);
+create index if not exists idx_document_events_doc  on azul.document_events(document_id);
 create index if not exists idx_document_events_user on azul.document_events(user_id);
 
 -- =========================================================
--- RLS
+-- 6) RLS
 -- =========================================================
 
 -- Ativar RLS
-alter table azul.document_types   enable row level security;
-alter table azul.documents        enable row level security;
-alter table azul.document_versions enable row level security;
-alter table azul.document_events  enable row level security;
+alter table azul.document_types     enable row level security;
+alter table azul.documents          enable row level security;
+alter table azul.document_versions  enable row level security;
+alter table azul.document_events    enable row level security;
 
 -- ---------------------------------------------------------
 -- DOCUMENT_TYPES
--- SELECT: equipe da firm e também usuários clientes vinculados a qualquer client dessa firm
+-- SELECT: equipe da firm + clientes vinculados a qualquer client dessa firm
 drop policy if exists "document_types_read_by_scope" on azul.document_types;
 create policy "document_types_read_by_scope"
 on azul.document_types
@@ -206,7 +239,7 @@ using (
       and m.firm_id = azul.document_types.firm_id
       and m.role in ('firm_admin','firm_staff')
   )
-  or exists ( -- clientes vinculados a um client cuja firm = document_types.firm_id
+  or exists ( -- clientes cuja client.firm_id = document_types.firm_id
     select 1
     from azul.memberships m2
     join azul.clients c on c.id = m2.client_id
@@ -268,38 +301,35 @@ using (
 
 -- ---------------------------------------------------------
 -- DOCUMENTS
+
 -- SELECT:
 --  - equipe da firm vê tudo da firm
---  - cliente vê seus documentos quando (is_visible_to_client = true) ou quando foi ele quem criou (origin='client' e created_by = auth.uid())
+--  - cliente vê seus docs se: is_visible_to_client = true OU (origin='client' e created_by = auth.uid())
 drop policy if exists "documents_select_by_scope" on azul.documents;
 create policy "documents_select_by_scope"
 on azul.documents
 for select
 to authenticated
 using (
-  exists ( -- equipe do escritório
+  -- staff da firm
+  exists (
     select 1 from azul.memberships m
     where m.user_id = auth.uid()
       and m.firm_id = azul.documents.firm_id
       and m.role in ('firm_admin','firm_staff')
   )
-  or exists ( -- usuário do cliente
-    select 1 from azul.memberships m2
-    where m2.user_id = auth.uid()
-      and m2.client_id = azul.documents.client_id
-  )
-  and (
-    -- se é cliente, precisa atender uma das regras abaixo; se é equipe, já passou na condição acima
+  or
+  (
+    -- usuário do cliente
     exists (
-      select 1 from azul.memberships m3
-      where m3.user_id = auth.uid()
-        and m3.client_id = azul.documents.client_id
-    ) = false
-    or -- não é cliente (é staff), passa
-    (true)
-    or -- fallback reading
-    (is_visible_to_client = true)
-    or (origin = 'client' and created_by = auth.uid())
+      select 1 from azul.memberships m2
+      where m2.user_id = auth.uid()
+        and m2.client_id = azul.documents.client_id
+    )
+    and (
+      is_visible_to_client = true
+      or (origin = 'client' and created_by = auth.uid())
+    )
   )
 );
 
@@ -320,11 +350,6 @@ with check (
         and m.firm_id = azul.documents.firm_id
         and m.role in ('firm_admin','firm_staff')
     )
-    and exists ( -- client pertence à firm
-      select 1 from azul.clients c
-      where c.id = azul.documents.client_id
-        and c.firm_id = azul.documents.firm_id
-    )
   )
   or
   (
@@ -337,14 +362,242 @@ with check (
     and origin = 'client'
     and status = 'submitted'
     and created_by = auth.uid()
-    and exists ( -- firm_id consistente com o client
-      select 1 from azul.clients c2
-      where c2.id = azul.documents.client_id
-        and c2.firm_id = azul.documents.firm_id
-    )
   )
 );
 
 -- UPDATE:
 --  - equipe da firm pode atualizar qualquer documento da firm
---  - cliente pode editar APENAS documentos criados por ele (origin='client' e created_by=auth.uid()) e enquanto status em ('dr_
+--  - cliente pode editar APENAS documentos criados por ele (origin='client' e created_by=auth.uid()) e enquanto status em ('draft','submitted')
+drop policy if exists "documents_update_by_scope" on azul.documents;
+create policy "documents_update_by_scope"
+on azul.documents
+for update
+to authenticated
+using (
+  exists ( -- equipe
+    select 1 from azul.memberships m
+    where m.user_id = auth.uid()
+      and m.firm_id = azul.documents.firm_id
+      and m.role in ('firm_admin','firm_staff')
+  )
+  or (
+    -- cliente dono do doc
+    exists (
+      select 1 from azul.memberships m2
+      where m2.user_id = auth.uid()
+        and m2.client_id = azul.documents.client_id
+    )
+    and origin = 'client'
+    and created_by = auth.uid()
+    and status in ('draft','submitted')
+  )
+)
+with check (
+  -- integridade firm↔client garantida pela FK composta
+  true
+);
+
+-- DELETE:
+--  - firm_admin pode excluir
+--  - cliente pode excluir documento que ele mesmo criou (origin='client', created_by=auth.uid(), status='draft')
+drop policy if exists "documents_delete_by_scope" on azul.documents;
+create policy "documents_delete_by_scope"
+on azul.documents
+for delete
+to authenticated
+using (
+  exists (
+    select 1 from azul.memberships m
+    where m.user_id = auth.uid()
+      and m.firm_id = azul.documents.firm_id
+      and m.role = 'firm_admin'
+  )
+  or (
+    exists (
+      select 1 from azul.memberships m2
+      where m2.user_id = auth.uid()
+        and m2.client_id = azul.documents.client_id
+    )
+    and origin = 'client'
+    and created_by = auth.uid()
+    and status = 'draft'
+  )
+);
+
+-- ---------------------------------------------------------
+-- DOCUMENT_VERSIONS
+
+-- SELECT: quem pode ver o documento pai pode ver suas versões
+drop policy if exists "document_versions_select_by_parent" on azul.document_versions;
+create policy "document_versions_select_by_parent"
+on azul.document_versions
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from azul.documents d
+    where d.id = azul.document_versions.document_id
+      and (
+        exists ( -- equipe
+          select 1 from azul.memberships m
+          where m.user_id = auth.uid()
+            and m.firm_id = d.firm_id
+            and m.role in ('firm_admin','firm_staff')
+        )
+        or (
+          exists ( -- cliente com acesso
+            select 1 from azul.memberships m2
+            where m2.user_id = auth.uid()
+              and m2.client_id = d.client_id
+          )
+          and (
+            d.is_visible_to_client = true
+            or (d.origin = 'client' and d.created_by = auth.uid())
+          )
+        )
+      )
+  )
+);
+
+-- INSERT:
+--  - equipe pode subir nova versão de qualquer documento da sua firm
+--  - cliente pode subir nova versão SOMENTE do documento que ele criou (origin='client', created_by=auth.uid()) e enquanto status em ('draft','submitted')
+drop policy if exists "document_versions_insert_by_scope" on azul.document_versions;
+create policy "document_versions_insert_by_scope"
+on azul.document_versions
+for insert
+to authenticated
+with check (
+  exists (
+    select 1
+    from azul.documents d
+    where d.id = azul.document_versions.document_id
+      and (
+        exists ( -- equipe
+          select 1 from azul.memberships m
+          where m.user_id = auth.uid()
+            and m.firm_id = d.firm_id
+            and m.role in ('firm_admin','firm_staff')
+        )
+        or ( -- cliente dono do doc
+          exists (
+            select 1 from azul.memberships m2
+            where m2.user_id = auth.uid()
+              and m2.client_id = d.client_id
+          )
+          and d.origin = 'client'
+          and d.created_by = auth.uid()
+          and d.status in ('draft','submitted')
+        )
+      )
+  )
+);
+
+-- UPDATE: bloqueado (versões são imutáveis)
+drop policy if exists "document_versions_update_none" on azul.document_versions;
+create policy "document_versions_update_none"
+on azul.document_versions
+for update
+to authenticated
+using (false)
+with check (false);
+
+-- DELETE: apenas firm_admin (exceções)
+drop policy if exists "document_versions_delete_admin" on azul.document_versions;
+create policy "document_versions_delete_admin"
+on azul.document_versions
+for delete
+to authenticated
+using (
+  exists (
+    select 1
+    from azul.documents d
+    join azul.memberships m
+      on m.user_id = auth.uid()
+     and m.firm_id = d.firm_id
+     and m.role = 'firm_admin'
+    where d.id = azul.document_versions.document_id
+  )
+);
+
+-- ---------------------------------------------------------
+-- DOCUMENT_EVENTS (logs)
+-- SELECT: equipe da firm (todos os eventos do documento) + cliente (eventos de docs que ele pode ver)
+drop policy if exists "document_events_select_by_scope" on azul.document_events;
+create policy "document_events_select_by_scope"
+on azul.document_events
+for select
+to authenticated
+using (
+  exists (
+    select 1
+    from azul.documents d
+    join azul.memberships m
+      on m.user_id = auth.uid()
+     and m.firm_id = d.firm_id
+     and m.role in ('firm_admin','firm_staff')
+    where d.id = azul.document_events.document_id
+  )
+  or exists (
+    select 1
+    from azul.documents d2
+    join azul.memberships m2
+      on m2.user_id = auth.uid()
+     and m2.client_id = d2.client_id
+    where d2.id = azul.document_events.document_id
+      and (
+        d2.is_visible_to_client = true
+        or (d2.origin = 'client' and d2.created_by = auth.uid())
+      )
+  )
+);
+
+-- INSERT: qualquer usuário autenticado que consiga ler o documento pode registrar evento
+drop policy if exists "document_events_insert_by_readers" on azul.document_events;
+create policy "document_events_insert_by_readers"
+on azul.document_events
+for insert
+to authenticated
+with check (
+  exists (
+    select 1
+    from azul.documents d
+    where d.id = azul.document_events.document_id
+      and (
+        exists (
+          select 1 from azul.memberships m
+          where m.user_id = auth.uid()
+            and m.firm_id = d.firm_id
+            and m.role in ('firm_admin','firm_staff')
+        )
+        or (
+          exists (
+            select 1 from azul.memberships m2
+            where m2.user_id = auth.uid()
+              and m2.client_id = d.client_id
+          )
+          and (
+            d.is_visible_to_client = true
+            or (d.origin = 'client' and d.created_by = auth.uid())
+          )
+        )
+      )
+  )
+);
+
+-- UPDATE/DELETE: bloqueado por padrão
+drop policy if exists "document_events_update_none" on azul.document_events;
+create policy "document_events_update_none"
+on azul.document_events
+for update
+to authenticated
+using (false)
+with check (false);
+
+drop policy if exists "document_events_delete_none" on azul.document_events;
+create policy "document_events_delete_none"
+on azul.document_events
+for delete
+to authenticated
+using (false);
