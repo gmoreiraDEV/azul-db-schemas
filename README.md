@@ -7,9 +7,9 @@
     01_base.sql
     02_blog.sql
     03_documents.sql
-    04_parcelamentos.sql
-    05_certificado.sql
+    04_installments.sql
+    05_certificates.sql
     06_warnings.sql
-    07_integracoes.sql
+    07_integrations.sql
     08_dashboards.sql
 ```
